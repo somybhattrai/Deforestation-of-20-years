@@ -1,0 +1,702 @@
+// ==========================
+// STEP 1: Study area
+// ==========================
+var studyArea = ee.Geometry.Rectangle([
+  -63.10, -11.30,
+  -62.20, -10.60
+]);
+
+Map.centerObject(studyArea, 9);
+Map.addLayer(studyArea, {color: 'red'}, 'Study Area');
+
+// ==========================
+// STEP 2: Common functions
+// ==========================
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.*').multiply(0.0000275).add(-0.2);
+  return image.addBands(opticalBands, null, true);
+}
+
+function maskLandsat(image) {
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(1 << 0).eq(0)
+    .and(qa.bitwiseAnd(1 << 1).eq(0))
+    .and(qa.bitwiseAnd(1 << 2).eq(0))
+    .and(qa.bitwiseAnd(1 << 3).eq(0))
+    .and(qa.bitwiseAnd(1 << 4).eq(0))
+    .and(qa.bitwiseAnd(1 << 5).eq(0));
+  return image.updateMask(mask);
+}
+
+// ==========================
+// STEP 3: 2005 composite and NDVI
+// ==========================
+var collection2005 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+  .filterBounds(studyArea)
+  .filterDate('2005-05-01', '2005-10-31');
+
+var image2005 = collection2005
+  .map(applyScaleFactors)
+  .map(maskLandsat)
+  .median()
+  .clip(studyArea);
+
+Map.addLayer(
+  image2005.select(['SR_B3', 'SR_B2', 'SR_B1']),
+  {min: 0.03, max: 0.30},
+  'RGB 2005'
+);
+
+var ndvi2005 = image2005.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI');
+
+Map.addLayer(
+  ndvi2005,
+  {min: 0, max: 1, palette: ['white', 'yellow', 'green']},
+  'NDVI 2005'
+);
+
+print('2005 bands:', image2005.bandNames());
+print('2005 NDVI ready');
+
+// ==========================
+// STEP 4: Forest mask for 2005
+// ==========================
+var forestThreshold = 0.65;
+
+// Keep as binary 0/1 for calculations
+var forest2005 = ndvi2005.gte(forestThreshold).rename('forest');
+
+// Display version only
+var forest2005Display = forest2005.selfMask();
+
+Map.addLayer(
+  forest2005Display,
+  {palette: ['006400']},
+  'Forest 2005'
+);
+
+// ==========================
+// STEP 5: 2024 composite and forest
+// ==========================
+var collection2024 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'))
+  .filterBounds(studyArea)
+  .filterDate('2024-05-01', '2024-10-31');
+
+var image2024 = collection2024
+  .map(applyScaleFactors)
+  .map(maskLandsat)
+  .median()
+  .clip(studyArea);
+
+Map.addLayer(
+  image2024.select(['SR_B4', 'SR_B3', 'SR_B2']),
+  {min: 0.03, max: 0.30},
+  'RGB 2024'
+);
+
+var ndvi2024 = image2024.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+
+Map.addLayer(
+  ndvi2024,
+  {min: 0, max: 1, palette: ['white', 'yellow', 'green']},
+  'NDVI 2024'
+);
+
+// Keep as binary 0/1 for calculations
+var forest2024 = ndvi2024.gte(forestThreshold).rename('forest');
+
+// Display version only
+var forest2024Display = forest2024.selfMask();
+
+Map.addLayer(
+  forest2024Display,
+  {palette: ['00AA00']},
+  'Forest 2024'
+);
+
+print('2024 bands:', image2024.bandNames());
+print('2024 NDVI ready');
+
+// ==========================
+// STEP 6: Deforestation map (2005 vs 2024)
+// ==========================
+var ndviDrop = ndvi2005.subtract(ndvi2024);
+var lossDropThreshold = 0.15;
+
+// Forest in 2005, not forest in 2024, and NDVI decreased enough
+var deforestation = forest2005
+  .and(forest2024.eq(0))
+  .and(ndviDrop.gte(lossDropThreshold))
+  .rename('loss');
+
+// Display version only
+var deforestationDisplay = deforestation.selfMask();
+
+Map.addLayer(
+  deforestationDisplay,
+  {palette: ['red']},
+  'Deforestation 2005-2024'
+);
+
+// ==========================
+// STEP 7: Area calculation
+// ==========================
+var pixelAreaKm2 = ee.Image.pixelArea().divide(1e6);
+
+// Forest area 2005
+var forestArea2005 = forest2005
+  .multiply(pixelAreaKm2)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: studyArea,
+    scale: 30,
+    maxPixels: 1e13,
+    bestEffort: true,
+    tileScale: 4
+  });
+
+// Forest area 2024
+var forestArea2024 = forest2024
+  .multiply(pixelAreaKm2)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: studyArea,
+    scale: 30,
+    maxPixels: 1e13,
+    bestEffort: true,
+    tileScale: 4
+  });
+
+// Deforestation area
+var deforestationArea = deforestation
+  .multiply(pixelAreaKm2)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: studyArea,
+    scale: 30,
+    maxPixels: 1e13,
+    bestEffort: true,
+    tileScale: 4
+  });
+
+// Print clean numeric outputs
+print('Forest area 2005 (km2):', forestArea2005.get('forest'));
+print('Forest area 2024 (km2):', forestArea2024.get('forest'));
+print('Total deforestation area 2005-2024 (km2):', deforestationArea.get('loss'));
+
+// Optional check
+var area2005 = ee.Number(forestArea2005.get('forest'));
+var area2024 = ee.Number(forestArea2024.get('forest'));
+print('Forest area difference 2005-2024 (km2):', area2005.subtract(area2024));
+
+// ==========================
+// STEP 8: Export deforestation map
+// ==========================
+Export.image.toDrive({
+  image: deforestation.toByte(),
+  description: 'Deforestation_2005_2024_Rondonia',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'Deforestation_2005_2024_Rondonia',
+  region: studyArea,
+  scale: 30,
+  maxPixels: 1e13
+});
+// ==========================
+// Forest loss and gain from class change only
+// ==========================
+var deforestation = forest2005.eq(1)
+  .and(forest2024.eq(0))
+  .rename('loss');
+
+var forestGain = forest2005.eq(0)
+  .and(forest2024.eq(1))
+  .rename('gain');
+
+Map.addLayer(deforestation.selfMask(), {palette: ['red']}, 'Forest Loss 2005-2024');
+Map.addLayer(forestGain.selfMask(), {palette: ['blue']}, 'Forest Gain 2005-2024');
+
+// Areas
+var lossArea = deforestation
+  .multiply(pixelAreaKm2)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: studyArea,
+    scale: 30,
+    maxPixels: 1e13,
+    bestEffort: true,
+    tileScale: 4
+  });
+
+var gainArea = forestGain
+  .multiply(pixelAreaKm2)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: studyArea,
+    scale: 30,
+    maxPixels: 1e13,
+    bestEffort: true,
+    tileScale: 4
+  });
+
+print('Forest loss area 2005-2024 (km2):', lossArea.get('loss'));
+print('Forest gain area 2005-2024 (km2):', gainArea.get('gain'));
+
+var netChange = ee.Number(gainArea.get('gain')).subtract(ee.Number(lossArea.get('loss')));
+print('Net forest change from gain-loss (km2):', netChange);
+
+
+
+//loop
+// ==========================
+// YEARLY FOREST COLLECTION (SAFE VERSION)
+// ==========================
+
+// Use all years from 2005 to 2024
+var years = ee.List.sequence(2005, 2024);
+
+// Function to get yearly forest mask
+var yearlyForest = ee.ImageCollection.fromImages(
+  years.map(function(year) {
+    year = ee.Number(year);
+
+    var start = ee.Date.fromYMD(year, 5, 1);
+    var end = ee.Date.fromYMD(year, 10, 31);
+
+    // Choose the correct Landsat collection
+    var collection = ee.ImageCollection(
+      ee.Algorithms.If(
+        year.lte(2011),
+        // 2005-2011: Landsat 5
+        ee.ImageCollection('LANDSAT/LT05/C02/T1_L2'),
+        ee.Algorithms.If(
+          year.eq(2012),
+          // 2012: Landsat 7
+          ee.ImageCollection('LANDSAT/LE07/C02/T1_L2'),
+          ee.Algorithms.If(
+            year.lte(2021),
+            // 2013-2021: Landsat 8
+            ee.ImageCollection('LANDSAT/LC08/C02/T1_L2'),
+            // 2022-2024: Landsat 8 + 9
+            ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+              .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'))
+          )
+        )
+      )
+    )
+    .filterBounds(studyArea)
+    .filterDate(start, end)
+    .map(applyScaleFactors)
+    .map(maskLandsat);
+
+    var count = collection.size();
+
+    // Empty fallback image so the loop never crashes
+    var emptyForest = ee.Image(0)
+      .rename('forest')
+      .updateMask(ee.Image(0))
+      .clip(studyArea)
+      .set('year', year)
+      .set('image_count', count);
+
+    // Only build NDVI if there are images
+    var forestImage = ee.Image(
+      ee.Algorithms.If(
+        count.gt(0),
+        (function() {
+          var image = collection.median().clip(studyArea);
+
+          var ndvi = ee.Image(
+            ee.Algorithms.If(
+              year.lte(2012),
+              // Landsat 5 and 7
+              image.normalizedDifference(['SR_B4', 'SR_B3']),
+              // Landsat 8 and 9
+              image.normalizedDifference(['SR_B5', 'SR_B4'])
+            )
+          ).rename('NDVI');
+
+          var forest = ndvi.gte(forestThreshold).rename('forest');
+
+          return forest
+            .set('year', year)
+            .set('image_count', count);
+        })(),
+        emptyForest
+      )
+    );
+
+    return forestImage;
+  })
+);
+
+print('Yearly forest collection:', yearlyForest);
+print('Images available per year:', yearlyForest.aggregate_array('image_count'));
+
+// Optional: test one year
+Map.addLayer(
+  ee.Image(yearlyForest.filter(ee.Filter.eq('year', 2012)).first()).selfMask(),
+  {palette: ['green']},
+  'Forest 2012'
+);
+
+
+// ==========================
+// ANNUAL FOREST LOSS / GAIN / NET CHANGE
+// SAFE VERSION
+// ==========================
+
+var pixelAreaKm2 = ee.Image.pixelArea().divide(1e6);
+
+// Build annual results sequentially
+var annualChange = ee.FeatureCollection(
+  ee.List(years.slice(1)).iterate(function(year, acc) {
+    year = ee.Number(year);
+    var prevYear = year.subtract(1);
+
+    var forestPrev = ee.Image(
+      yearlyForest.filter(ee.Filter.eq('year', prevYear)).first()
+    );
+
+    var forestCurr = ee.Image(
+      yearlyForest.filter(ee.Filter.eq('year', year)).first()
+    );
+
+    // Binary loss and gain
+    var loss = forestPrev.eq(1).and(forestCurr.eq(0)).rename('loss');
+    var gain = forestPrev.eq(0).and(forestCurr.eq(1)).rename('gain');
+
+    // Put both into one image so only one reduceRegion is needed
+    var areaImage = ee.Image.cat([
+      loss.multiply(pixelAreaKm2).rename('loss_km2'),
+      gain.multiply(pixelAreaKm2).rename('gain_km2')
+    ]);
+
+    var stats = areaImage.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: studyArea,
+      scale: 30,
+      maxPixels: 1e13,
+      bestEffort: true,
+      tileScale: 8
+    });
+
+    var lossKm2 = ee.Number(stats.get('loss_km2', 0));
+    var gainKm2 = ee.Number(stats.get('gain_km2', 0));
+    var netKm2 = gainKm2.subtract(lossKm2);
+
+    var feature = ee.Feature(null, {
+      year: year,
+      previous_year: prevYear,
+      loss_km2: lossKm2,
+      gain_km2: gainKm2,
+      net_change_km2: netKm2
+    });
+
+    return ee.FeatureCollection(acc).merge(ee.FeatureCollection([feature]));
+  }, ee.FeatureCollection([]))
+);
+
+print('Annual forest change table:', annualChange);
+
+// ==========================
+// TOTALS
+// ==========================
+var totalLoss = annualChange.aggregate_sum('loss_km2');
+var totalGain = annualChange.aggregate_sum('gain_km2');
+var totalNet = annualChange.aggregate_sum('net_change_km2');
+
+print('Total cumulative forest loss 2005-2024 (km2):', totalLoss);
+print('Total cumulative forest gain 2005-2024 (km2):', totalGain);
+print('Total net forest change 2005-2024 (km2):', totalNet);
+
+// ==========================
+// PEAK DEFORESTATION YEAR
+// ==========================
+var peakLossFeature = annualChange.sort('loss_km2', false).first();
+
+print('Peak deforestation year:', peakLossFeature.get('year'));
+print('Peak deforestation area (km2):', peakLossFeature.get('loss_km2'));
+
+// ==========================
+// CHART: ANNUAL DEFORESTATION
+// ==========================
+var lossChart = ui.Chart.feature.byFeature({
+  features: annualChange,
+  xProperty: 'year',
+  yProperties: ['loss_km2']
+})
+.setChartType('LineChart')
+.setOptions({
+  title: 'Annual Deforestation (Forest Loss) 2006-2024',
+  hAxis: {title: 'Year'},
+  vAxis: {title: 'Forest loss (km²)'},
+  lineWidth: 2,
+  pointSize: 4
+});
+
+print(lossChart);
+
+// ==========================
+// OPTIONAL: EXPORT TABLE
+// ==========================
+Export.table.toDrive({
+  collection: annualChange,
+  description: 'Annual_Forest_Change_2005_2024',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'Annual_Forest_Change_2005_2024',
+  fileFormat: 'CSV'
+});
+
+// Masked versions for cleaner output
+var forest2005Export = forest2005.selfMask().toByte();
+var forest2024Export = forest2024.selfMask().toByte();
+var deforestationExport = deforestation.selfMask().toByte();
+var forestGainExport = forestGain.selfMask().toByte();
+
+// Export Forest 2005
+Export.image.toDrive({
+  image: forest2005Export,
+  description: 'Forest_2005_Rondonia_masked',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'Forest_2005_Rondonia_masked',
+  region: studyArea,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+// Export Forest 2024
+Export.image.toDrive({
+  image: forest2024Export,
+  description: 'Forest_2024_Rondonia_masked',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'Forest_2024_Rondonia_masked',
+  region: studyArea,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+// Export Deforestation
+Export.image.toDrive({
+  image: deforestationExport,
+  description: 'Deforestation_2005_2024_Rondonia_masked',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'Deforestation_2005_2024_Rondonia_masked',
+  region: studyArea,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+// Export Forest Gain
+Export.image.toDrive({
+  image: forestGainExport,
+  description: 'Forest_Gain_2005_2024_Rondonia_masked',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'Forest_Gain_2005_2024_Rondonia_masked',
+  region: studyArea,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+
+
+// ==========================
+// 1. STUDY AREA
+// ==========================
+var studyArea = ee.Geometry.Rectangle([
+  -63.10, -11.30,
+  -62.20, -10.60
+]);
+
+Map.centerObject(studyArea, 9);
+Map.addLayer(studyArea, {color: 'red'}, 'Study Area');
+
+// ==========================
+// 2. COMMON FUNCTIONS
+// ==========================
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.*').multiply(0.0000275).add(-0.2);
+  return image.addBands(opticalBands, null, true);
+}
+
+function maskLandsat(image) {
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(1 << 0).eq(0)
+    .and(qa.bitwiseAnd(1 << 1).eq(0))
+    .and(qa.bitwiseAnd(1 << 2).eq(0))
+    .and(qa.bitwiseAnd(1 << 3).eq(0))
+    .and(qa.bitwiseAnd(1 << 4).eq(0))
+    .and(qa.bitwiseAnd(1 << 5).eq(0));
+  return image.updateMask(mask);
+}
+
+// ==========================
+// 3. SETTINGS
+// ==========================
+var forestThreshold = 0.60;   // Recommended threshold
+var years = ee.List.sequence(2005, 2024);
+
+// ==========================
+// 4. FUNCTION: GET YEARLY NDVI + FOREST
+// ==========================
+function getAnnualProducts(year) {
+  year = ee.Number(year);
+
+  var start = ee.Date.fromYMD(year, 5, 1);
+  var end = ee.Date.fromYMD(year, 10, 31);
+
+  var collection = ee.ImageCollection(
+    ee.Algorithms.If(
+      year.lte(2011),
+      ee.ImageCollection('LANDSAT/LT05/C02/T1_L2'),
+      ee.Algorithms.If(
+        year.eq(2012),
+        ee.ImageCollection('LANDSAT/LE07/C02/T1_L2'),
+        ee.Algorithms.If(
+          year.lte(2021),
+          ee.ImageCollection('LANDSAT/LC08/C02/T1_L2'),
+          ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+            .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'))
+        )
+      )
+    )
+  )
+  .filterBounds(studyArea)
+  .filterDate(start, end)
+  .map(applyScaleFactors)
+  .map(maskLandsat);
+
+  var count = collection.size();
+
+  var emptyNdvi = ee.Image(0)
+    .rename('NDVI')
+    .updateMask(ee.Image(0))
+    .clip(studyArea)
+    .set('year', year)
+    .set('image_count', count);
+
+  var emptyForest = ee.Image(0)
+    .rename('forest')
+    .updateMask(ee.Image(0))
+    .clip(studyArea)
+    .set('year', year)
+    .set('image_count', count);
+
+  var ndvi = ee.Image(
+    ee.Algorithms.If(
+      count.gt(0),
+      (function() {
+        var image = collection.median().clip(studyArea);
+
+        return ee.Image(
+          ee.Algorithms.If(
+            year.lte(2012),
+            image.normalizedDifference(['SR_B4', 'SR_B3']),
+            image.normalizedDifference(['SR_B5', 'SR_B4'])
+          )
+        ).rename('NDVI')
+         .set('year', year)
+         .set('image_count', count);
+      })(),
+      emptyNdvi
+    )
+  );
+
+  var forest = ee.Image(
+    ee.Algorithms.If(
+      count.gt(0),
+      ndvi.gte(forestThreshold)
+        .rename('forest')
+        .set('year', year)
+        .set('image_count', count),
+      emptyForest
+    )
+  );
+
+  return {
+    ndvi: ndvi,
+    forest: forest
+  };
+}
+
+// ==========================
+// 5. PREVIEW ONE YEAR
+// ==========================
+var sample = getAnnualProducts(2005);
+
+Map.addLayer(
+  sample.ndvi,
+  {min: 0, max: 1, palette: ['white', 'yellow', 'green']},
+  'NDVI 2005'
+);
+
+Map.addLayer(
+  sample.forest.selfMask(),
+  {palette: ['darkgreen']},
+  'Forest 2005'
+);
+
+// ==========================
+// 6. EXPORT ALL YEARS TO DRIVE
+// ==========================
+// This creates export tasks in the Tasks tab.
+// Run them from there.
+
+years.getInfo().forEach(function(year) {
+  var annual = getAnnualProducts(year);
+
+  // NDVI visual image
+  var ndviVis = annual.ndvi.visualize({
+    min: 0,
+    max: 1,
+    palette: ['white', 'yellow', 'green']
+  });
+
+  // Forest visual image
+  var forestVis = annual.forest.selfMask().visualize({
+    min: 1,
+    max: 1,
+    palette: ['darkgreen']
+  });
+
+  // Export NDVI
+  Export.image.toDrive({
+    image: ndviVis,
+    description: 'NDVI_VIS_' + year + '_Rondonia',
+    folder: 'GEE_exports',
+    fileNamePrefix: 'NDVI_VIS_' + year + '_Rondonia',
+    region: studyArea,
+    scale: 60,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13
+  });
+
+  // Export Forest
+  Export.image.toDrive({
+    image: forestVis,
+    description: 'Forest_VIS_' + year + '_Rondonia',
+    folder: 'GEE_exports',
+    fileNamePrefix: 'Forest_VIS_' + year + '_Rondonia',
+    region: studyArea,
+    scale: 60,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13
+  });
+});
+
+// ==========================
+// 7. OPTIONAL CHECK
+// ==========================
+var yearInfo = years.map(function(year) {
+  var annual = getAnnualProducts(year);
+  return ee.Feature(null, {
+    year: year,
+    image_count: annual.ndvi.get('image_count')
+  });
+});
+
+print('Images available per year:', ee.FeatureCollection(yearInfo));
